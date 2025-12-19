@@ -1,0 +1,109 @@
+# ==============================================================================
+# SCRIPT DE AUTOMAÇÃO DE GOVERNANÇA (TAGS + POLICIES) VIA PLANILHA
+# ==============================================================================
+
+# 1. Configurações Iniciais
+$CSVPath = "C:\Scripts\scripts\aplica_tags\tag_poc.csv"
+$PolicyId = "cd3aa116-8754-49c9-a813-ad46512ece54"
+$PolicyDisplayName = "Inherit a tag from the resource group if missing"
+
+# Importa os dados usando o delimitador ';' conforme seu arquivo
+Write-Host "📂 Carregando dados da planilha..." -ForegroundColor Cyan
+try {
+    $Data = Import-Csv -Path $CSVPath -Delimiter ";"
+} catch {
+    Write-Error "❌ Erro ao ler o arquivo CSV. Verifique se o caminho está correto."
+    exit
+}
+
+$CurrentSub = ""
+
+# 2. Loop de Processamento
+foreach ($Row in $Data) {
+    # Pula linhas vazias se houver
+    if ([string]::IsNullOrWhiteSpace($Row.NAME)) { continue }
+
+    $RgName = $Row.NAME
+    $Subscription = $Row.SUBSCRIPTION
+    $RgLocation = $Row.LOCATION
+    
+    Write-Host "`n" + ("=" * 60) -ForegroundColor Gray
+    Write-Host "📦 RECURSO: $RgName" -ForegroundColor Cyan -NoNewline
+    Write-Host " (Assinatura: $Subscription)" -ForegroundColor DarkGray
+
+    # 3. Troca de Assinatura Automática
+    if ($CurrentSub -ne $Subscription) {
+        Write-Host "🔄 Trocando contexto para assinatura..." -ForegroundColor Yellow
+        az account set --subscription $Subscription
+        if ($LASTEXITCODE -ne 0) { 
+            Write-Error "❌ Falha ao acessar assinatura $Subscription. Pulando este item."
+            continue 
+        }
+        $CurrentSub = $Subscription
+    }
+
+    # 4. Mapeamento das Tags (Conforme os nomes das colunas da sua planilha)
+    $Tags = @{
+        "environment" = $Row.'TAG - environment'
+        "cost-center" = $Row.'TAG - cost-center'
+        "application" = $Row.'TAG - application'
+        "cost-owner"  = $Row.'TAG - cost-owner'
+    }
+
+    $Scope = "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$RgName"
+
+    # 5. Aplicação de Tags no Resource Group
+    Write-Host "➡️ Aplicando tags no RG..." -ForegroundColor Green
+    foreach ($Tag in $Tags.GetEnumerator()) {
+        if (-not [string]::IsNullOrWhiteSpace($Tag.Value)) {
+            az group update -n $RgName --set "tags.$($Tag.Key)=$($Tag.Value)" | Out-Null
+        }
+    }
+
+    # 6. Criação de Assignments e Remediações (Loop para as 4 tags)
+    foreach ($Tag in $Tags.GetEnumerator()) {
+        $Key = $Tag.Key
+        if ([string]::IsNullOrWhiteSpace($Tag.Value)) { continue }
+
+        # Limita o nome para não estourar os 64 caracteres do Azure
+        $ShortRg = if ($RgName.Length -gt 25) { $RgName.Substring(0,25) } else { $RgName }
+        $AssignmentName = "inh-$Key-$($ShortRg.Replace(' ','-'))"
+        $RemediationName = "rem-$Key-$($ShortRg.Replace(' ','-'))"
+
+        Write-Host "🏗️ Configurando Política [$Key]..." -ForegroundColor DarkYellow
+
+        # Criar JSON de parâmetros temporário (TagName)
+        $Params = @{ tagName = @{ value = $Key } } | ConvertTo-Json -Compress
+        $TempFile = [System.IO.Path]::GetTempFileName()
+        $Params | Out-File $TempFile -Encoding UTF8
+
+        # Executa a criação do Assignment
+        $Assignment = az policy assignment create `
+            --name $AssignmentName `
+            --display-name "$PolicyDisplayName - $Key" `
+            --scope $Scope `
+            --policy $PolicyId `
+            --params $TempFile `
+            --assign-identity `
+            --identity-scope $Scope `
+            --role Contributor `
+            --location $RgLocation
+
+        Remove-Item $TempFile -Force
+
+        # Se o Assignment foi criado (ou já existia), dispara a Remediação
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "   ✅ Assignment OK. Disparando remediação..." -ForegroundColor Green
+            az policy remediation create `
+                --name $RemediationName `
+                --resource-group $RgName `
+                --policy-assignment $AssignmentName `
+                --resource-discovery-mode ReEvaluateCompliance | Out-Null
+        } else {
+            Write-Warning "   ⚠️ Falha ao criar assignment para a tag $Key."
+        }
+    }
+}
+
+Write-Host "`n" + ("=" * 60)
+Write-Host "✅ SUCESSO: Processamento da planilha concluído!" -ForegroundColor Cyan
