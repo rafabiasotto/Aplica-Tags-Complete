@@ -3,7 +3,7 @@
 # ==============================================================================
 
 # 1. Configurações Iniciais
-$CSVPath = "C:\Scripts\scripts\aplica_tags\tag_poc.csv"
+$CSVPath = "C:\..."
 $PolicyId = "cd3aa116-8754-49c9-a813-ad46512ece54"
 $PolicyDisplayName = "Inherit a tag from the resource group if missing"
 
